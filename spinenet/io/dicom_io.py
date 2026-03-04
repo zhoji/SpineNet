@@ -57,7 +57,8 @@ def load_dicoms(
 
         if require_extensions:
             assert all(
-                [".dcm" == path[-4:] for path in paths]
+                os.path.splitext(str(path))[1].lower() == ".dcm"
+                for path in paths
             ), "All paths must have .dcm extension. To ignore extension, set require_extensions=False"
 
         dicom_files = [dcmread(path) for path in paths]
