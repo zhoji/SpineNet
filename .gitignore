@@ -1,9 +1,13 @@
+.DS_Store
+
 # SpineNet Specific
 spinenet-venv
 spinenet/weights/*
 tutorials/example_scans/*
 tutorials/results/*
-
+tutorials/testing/*
+results/*
+data
 
 # Standard Python GitIgnore
 # Byte-compiled / optimized / DLL files
