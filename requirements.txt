@@ -11,3 +11,5 @@ torch
 torchvision
 tqdm
 matplotlib
+pylibjpeg
+pylibjpeg-libjpeg
