@@ -27,6 +27,8 @@ import spinenet
 from spinenet import SpineNet, download_example_scan
 from spinenet.io import load_dicoms_from_folder
 
+import pandas as pd
+
 def collect_subject_list(args):
     """
     Resolve subjects list.
@@ -58,230 +60,278 @@ def collect_subject_list(args):
 
     return subj_candidates
 
-def find_candidate_series(subject_dir, sample_per_folder=8):
+def get_patient_id_from_files(file_list):
+    for f in file_list:
+        try:
+            ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            pid = getattr(ds, "PatientID", None)
+            if pid:
+                return str(pid)
+        except:
+            continue
+    return None
+
+def find_candidate_series(subject_dir):
     """
     Recursively search subject_dir for folders that likely contain Sagittal T2 series.
     Returns a list of candidate folder dicts sorted by descending file count:
       {'path': path, 'n_files': n, 'series_description': desc}
     """
-    sag_t2_tokens = [
-        'sag', 'sagittal',
-        't2', 't2w', 't2-weighted', 't2_tse', 't2_tse_fs', 'sag_t2', 'sagittal_t2'
-    ]
-    candidates = []
-    for root, dirs, files in os.walk(subject_dir):
-        if not files:
-            continue
+    series_dict = defaultdict(lambda: {
+        "files": [],
+        "series_description": None
+    })
 
-        # collect candidate file paths (prefer .dcm but include others for header testing)
-        file_paths = [os.path.join(root, f) for f in files]
-        # sample a few files to inspect headers
-        n_matched = 0
-        n_examined = 0
-        series_desc = None
-        for fpath in file_paths[:sample_per_folder]:
+    # --- group ALL dicoms by SeriesInstanceUID ---
+    for root, _, files in os.walk(subject_dir):
+        for f in files:
+            fpath = os.path.join(root, f)
+            if not os.path.isfile(fpath):
+                continue
             try:
                 ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
-            except Exception:
+
+                uid = getattr(ds, "SeriesInstanceUID", None)
+                if uid is None:
+                    continue
+
+                series_dict[uid]["files"].append(fpath)
+
+                if series_dict[uid]["series_description"] is None:
+                    desc = getattr(ds, "SeriesDescription", None) or getattr(ds, "ProtocolName", None)
+                    if desc:
+                        series_dict[uid]["series_description"] = str(desc)
+
+            except:
                 continue
-            n_examined += 1
-            modality = getattr(ds, 'Modality', '') or ''
-            if modality and modality.upper() != 'MR':
-                continue
-            # combine descriptive fields and folder name
-            desc_fields = []
-            for key in ('SeriesDescription', 'ProtocolName', 'SequenceName'):
-                val = getattr(ds, key, '')
-                if val:
-                    desc_fields.append(str(val).lower())
-            desc_fields.append(os.path.basename(root).lower())
-            joined = ' '.join(desc_fields)
-            if any(tok in joined for tok in sag_t2_tokens):
-                n_matched += 1
-                if not series_desc:
-                    series_desc = getattr(ds, 'SeriesDescription', '') or getattr(ds, 'ProtocolName', '') or ''
-        # quick count of readable DICOM files in folder
-        total_dicom_files = 0
-        for fpath in file_paths:
+
+    candidates = []
+
+    # --- evaluate EACH series ---
+    for uid, info in series_dict.items():
+        files = info["files"]
+        if len(files) < 5:
+            continue  # too small to be real series
+
+        n_match = 0
+        n_total = 0
+
+        for f in files[:20]:  # sample up to 20 slices
             try:
-                _ = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
-                total_dicom_files += 1
-            except Exception:
+                ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            except:
+                continue
+
+            n_total += 1
+
+            # modality
+            if getattr(ds, "Modality", "").upper() != "MR":
+                continue
+
+            # description (STRICT — no folder name)
+            desc = (
+                str(getattr(ds, "SeriesDescription", "") or "") + " " +
+                str(getattr(ds, "ProtocolName", "") or "")
+            ).lower()
+
+            is_sag = "sag" in desc or "sagittal" in desc
+            is_t2  = "t2" in desc
+
+            # orientation
+            is_sag_geom = False
+            try:
+                orientation = np.array(ds.ImageOrientationPatient).astype(float)
+                is_sag_geom = abs(orientation[0]) > 0.7 and abs(orientation[3]) > 0.7
+            except:
                 pass
 
-        # treat as candidate if any samples matched or folder name includes 't2'
-        folder_name = os.path.basename(root).lower()
-        if n_matched > 0 or 't2' in folder_name:
+            if is_sag and is_t2:
+                n_match += 1
+
+        # require majority match (NOT just 1 slice)
+        if n_total > 0 and n_match >= max(3, int(0.3 * n_total)):
             candidates.append({
-                'path': root,
-                'n_matched_samples': n_matched,
-                'n_examined_samples': n_examined,
-                'n_files': total_dicom_files,
-                'series_description': series_desc or folder_name
+                "uid": uid,
+                "files": files,
+                "series_description": info["series_description"],
+                "n_files": len(files)
             })
-    # fallback: if nothing found, include any folder named "DICOM" or top-level with any dicoms
-    if not candidates:
-        for root, dirs, files in os.walk(subject_dir):
-            if 'dicom' in os.path.basename(root).lower():
-                total = 0
-                for f in files[:50]:
-                    try:
-                        _ = pydicom.dcmread(os.path.join(root, f), stop_before_pixels=True, force=True)
-                        total += 1
-                    except Exception:
-                        pass
-                if total > 0:
-                    candidates.append({
-                        'path': root,
-                        'n_matched_samples': 0,
-                        'n_examined_samples': 0,
-                        'n_files': total,
-                        'series_description': os.path.basename(root)
-                    })
-        # last resort: treat subject root if it contains dicoms
-        if not candidates:
-            total = 0
-            for f in os.listdir(subject_dir)[:200]:
-                fp = os.path.join(subject_dir, f)
-                if os.path.isfile(fp):
-                    try:
-                        _ = pydicom.dcmread(fp, stop_before_pixels=True, force=True)
-                        total += 1
-                    except Exception:
-                        pass
-            if total > 0:
-                candidates.append({
-                    'path': subject_dir,
-                    'n_matched_samples': 0,
-                    'n_examined_samples': 0,
-                    'n_files': total,
-                    'series_description': 'subject_root'
-                })
 
-    # --- de-duplicate parent candidates when a child candidate contains DICOM files ---
-    # If a candidate has any descendant candidate (child folder) with n_files > 0,
-    # drop the parent candidate. This preserves the deepest folder that actually
-    # contains DICOM files (e.g., keep .../DICOM, drop .../2_Sag_T2_FAT_SAT).
-    deduped = []
-    # ensure candidates are absolute and normalized
-    for c in candidates:
-        c['path'] = os.path.normpath(os.path.abspath(c['path']))
-
-    for c in candidates:
-        parent_path = c['path']
-        # check whether there exists another candidate that is a strict descendant
-        has_descendant_with_files = False
-        for other in candidates:
-            if other['path'] == parent_path:
-                continue
-            # other is a descendant if it starts with parent_path + os.sep
-            if other['path'].startswith(parent_path + os.sep) and other.get('n_files', 0) > 0:
-                has_descendant_with_files = True
-                break
-        if not has_descendant_with_files:
-            deduped.append(c)
-
-    # sort deduped by file count (or whatever ordering you prefer)
-    candidates = sorted(deduped, key=lambda x: x['n_files'], reverse=True)
-    # --- end dedupe ---
-
-    return sorted(candidates, key=lambda x: x['n_files'], reverse=True)
+    # sort by size (largest first)
+    return sorted(candidates, key=lambda x: x["n_files"], reverse=True)
 
 def _group_files_by_seriesuid(folder_path):
     """
     For all readable DICOM files in folder_path, group their full paths by SeriesInstanceUID.
     Returns dict: {seriesuid: [filepaths...], ...}
     """
-    groups = defaultdict(list)
+    groups = defaultdict(lambda: {"files": [], "series_description": None})
+
     for fname in os.listdir(folder_path):
         fpath = os.path.join(folder_path, fname)
         if not os.path.isfile(fpath):
             continue
         try:
             ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
+
             uid = getattr(ds, 'SeriesInstanceUID', None) or getattr(ds, 'SeriesUID', None)
             if uid is None:
-                # use fallback grouping token (e.g., SeriesDescription+InstanceNumber)
                 uid = (getattr(ds, 'SeriesDescription', '') or '') + '_' + str(getattr(ds, 'SeriesNumber', ''))
-            groups[uid].append(fpath)
-        except Exception:
-            # skip unreadable files
+
+            groups[uid]["files"].append(fpath)
+
+            # store description once
+            if groups[uid]["series_description"] is None:
+                desc = getattr(ds, "SeriesDescription", None) or getattr(ds, "ProtocolName", None)
+                if desc:
+                    groups[uid]["series_description"] = str(desc)
+
+        except:
             continue
+
     return groups
 
-def load_scans_for_subject(subject_id, data_dir, require_extensions=True):
+def load_scans_for_subject(subject_id, data_dir, require_extensions=False):
     """
-    Locate all candidate Sagittal T2 series for subject_id under data_dir, load each series,
-    and return list of (scan, scan_name) tuples.
+    Locate all candidate Sagittal T2 series for subject_id under data_dir
 
-    - subject_id is expected to map to data_dir/subject_id
-    - Each found folder may yield multiple series (grouped by SeriesInstanceUID)
+    Returns:
+        list of dicts: [{"scan": scan, "patient_id": patient_id}]
     """
-    start_time = time.time()
     subject_dir = os.path.join(data_dir, subject_id)
-    print(f"\nProcessing subject {subject_id}")
     print(f"\n[1/3] Loading DICOM scans...\n      searching under {subject_dir}")
 
     if not os.path.exists(subject_dir):
         raise FileNotFoundError(f"Subject directory not found: {subject_dir}")
 
-    candidates = find_candidate_series(subject_dir, sample_per_folder=8)
+    candidates = find_candidate_series(subject_dir)
     if not candidates:
-        print("No candidate Sagittal-T2 folders found for subject; returning empty list")
+        print("No Sagittal T2 series found; returning empty list")
         return []
 
-    print("Candidate Sagittal-T2 folders (sorted by file count):")
+    print("Candidate Sagittal T2 series:")
     for i, c in enumerate(candidates):
-        print(f"  [{i}] {c['path']} (n_files={c['n_files']}, desc='{c['series_description']}')")
+        print(f"  [{i}] '{c['series_description']}' (n_files={c['n_files']})")
 
     loaded = []
     for c in candidates:
-        folder = c['path']
-        # group files by SeriesInstanceUID to avoid mixed-series loading
-        groups = _group_files_by_seriesuid(folder)
-        if not groups:
-            print(f"  - No readable DICOM files in {folder}; skipping")
+        file_list = c["files"]
+        series_desc = c["series_description"] or "UNKNOWN_SERIES"
+        
+        if len(file_list) < 5:
+            print(f"  - Skipping '{series_desc}' (too few slices: {len(file_list)})")
             continue
 
-        # sort groups by descending number of files (likely the main series first)
-        groups_items = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
-        for uid, file_list in groups_items:
-            # create a temporary directory and symlink (or copy) the series files into it
-            tmpdir = None
+        tmpdir = None
+
+        try:
+            # --- create temp dir ---
+            tmpdir = tempfile.mkdtemp(prefix=f"spinenet_{subject_id}_")
+
+            # --- symlink or copy files ---
+            for src in file_list:
+                dst = os.path.join(tmpdir, os.path.basename(src))
+                try:
+                    os.symlink(os.path.abspath(src), dst)
+                except Exception:
+                    shutil.copy2(src, dst)
+
+            patient_id = get_patient_id_from_files(file_list) or subject_id
+
+            print(f"\n  Loading series: '{series_desc}' ({len(file_list)} slices)")
+
             try:
-                tmpdir = tempfile.mkdtemp(prefix=f"spinenet_{subject_id}_{uuid.uuid4().hex[:6]}_")
-                for src in file_list:
-                    basename = os.path.basename(src)
-                    dst = os.path.join(tmpdir, basename)
-                    try:
-                        os.symlink(os.path.abspath(src), dst)
-                    except Exception:
-                        # fallback to copy if symlink not allowed (Windows or permission)
-                        shutil.copy2(src, dst)
-
-                scan_name = f"{subject_id}_{os.path.basename(folder)}_uid_{uid[:8]}"
-                print(f"\n  Loading series uid={uid} (n_files={len(file_list)}) from {folder}")
                 scan = load_dicoms_from_folder(tmpdir, require_extensions=require_extensions)
-                if scan is None:
-                    print(f"    - loader returned None for {scan_name}; skipping")
-                else:
-                    print(f"    ✓ Loaded scan '{scan_name}'")
-                    print(f"      shape: {getattr(scan, 'volume', None).shape if scan else 'N/A'}")
-                    print(f"      pixel spacing: {getattr(scan, 'pixel_spacing', None) if scan else 'N/A'}")
-                    print(f"      slice thickness: {getattr(scan, 'slice_thickness', None) if scan else 'N/A'}")
-                    loaded.append((scan, scan_name))
             except Exception as e:
-                print(f"    - Error loading series uid={uid} from {folder}: {e}")
-            finally:
-                if tmpdir and os.path.exists(tmpdir):
-                    try:
-                        shutil.rmtree(tmpdir)
-                    except Exception:
-                        pass
+                print(f"    - Skipping (load failed): {e}")
+                continue
 
-    end_time = time.time()
-    print(f"Finished locating/loading scans for subject {subject_id} in {end_time - start_time:.2f}s")
+            if scan is None:
+                print("    - Loader returned None; skipping")
+                continue
+
+            print(f"    ✓ Loaded scan")
+            print(f"      shape: {scan.volume.shape}")
+            print(f"      pixel spacing: {scan.pixel_spacing}")
+            print(f"      slice thickness: {scan.slice_thickness}")
+            loaded.append({"scan": scan, "patient_id": patient_id, "series_description": series_desc})
+        except Exception as e:
+            print(f"    - Error processing '{series_desc}': {e}")
+        finally:
+            if tmpdir and os.path.exists(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print(f"Finished loading scans for subject {subject_id}")
     return loaded
+
+def process_ivd_grades(ivd_grades, subject_id):
+    """
+    Convert SpineNet ivd_grades DataFrame into:
+      - wide (all metrics)
+      - long (all metrics)
+      - wide Pfirrmann only
+      - long Pfirrmann only
+    """
+
+    # normalize index → level column
+    df = ivd_grades.copy()
+    df = df.reset_index().rename(columns={"index": "level"})
+
+    # ---------- LONG (all metrics) ----------
+    long_full = df.copy()
+    long_full.insert(0, "subject_id", subject_id)
+
+    # ---------- WIDE (all metrics) ----------
+    wide_full = {"subject_id": subject_id}
+
+    for _, row in df.iterrows():
+        level = row["level"]
+        for col in df.columns:
+            if col == "level":
+                continue
+            wide_full[f"{col}_{level}"] = row[col]
+
+    # ---------- FOR METAGWAS ANALYSIS ----------
+    # For lumbar Pfirrmann scores only
+    LUMBAR_LEVELS = ["L1-L2", "L2-L3", "L3-L4", "L4-L5", "L5-S1"]
+
+    # ---------- LONG (Pfirrmann only) ----------
+    #long_pf = df[["level", "Pfirrmann"]].copy()
+    long_pf = df[df["level"].isin(LUMBAR_LEVELS)][["level", "Pfirrmann"]].copy()
+    long_pf.insert(0, "subject_id", subject_id)
+
+    # ---------- WIDE (Pfirrmann only) ----------
+    wide_pf = {"subject_id": subject_id}
+    for _, row in df.iterrows():
+        if row["level"] in LUMBAR_LEVELS:
+            wide_pf[row["level"]] = row["Pfirrmann"]
+
+    return wide_full, long_full, wide_pf, long_pf
+
+def find_repeat_inconsistencies(df_long_pf):
+    """
+    Identify subjects where Pfirrmann grades differ across repeats.
+
+    Returns:
+        DataFrame with one row per inconsistent (subject, level)
+    """
+    records = []
+
+    grouped = df_long_pf.groupby(["subject_id", "level"])
+
+    for (subj, level), g in grouped:
+        unique_vals = [int(x) for x in g["Pfirrmann"].dropna().unique()]
+
+        if len(unique_vals) > 1:
+            records.append({
+                "subject_id": subj,
+                "level": level,
+                "values": ",".join(map(str, unique_vals)),
+                "n_repeats": len(g),
+                "series_desc_list": "; ".join(map(str, g["series_desc"].unique()))
+            })
+
+    return pd.DataFrame(records)
 
 def main():
     p = argparse.ArgumentParser(
@@ -325,9 +375,26 @@ def main():
 
     # Initialize SpineNet
     spnt = SpineNet(device=device, verbose=True)
+
+    wide_full_rows = []
+    long_full_rows = []
+
+    wide_pf_rows = []
+    long_pf_rows = []
+
+    repeat_counter = defaultdict(int)
     
     # Batch process each subject
-    for subject_id in subj_list:
+    start_global = time.time()
+    total = len(subj_list)
+
+    for i, subject_id in enumerate(subj_list, 1):
+        elapsed = time.time() - start_global
+        avg_time = elapsed / i
+        remaining = avg_time * (total - i)
+
+        print(f"\n[{i}/{total}] Processing subject: {subject_id}")
+        print(f"  Elapsed: {elapsed/60:.1f} min | ETA: {remaining/60:.1f} min")
         # Load scan
         scans = load_scans_for_subject(subject_id, data_dir)
 
@@ -336,18 +403,24 @@ def main():
             continue
         
         # Detect vertebrae
-        for scan, scan_name in scans:
+        for item in scans:
+            scan = item["scan"]
+            base_id = item["patient_id"]
+
+            # Include handling for multiple Sag T2 scans
+            repeat_idx = repeat_counter[base_id]
+            repeat_counter[base_id] += 1
+
+            subject_id_clean = base_id
+            is_primary = (repeat_idx == 0)
+
             print("\n[2/3] Detecting vertebrae...")
-            start_time = time.time()
             vert_dicts = spnt.detect_vb(scan.volume, scan.pixel_spacing)
             detected_labels = [v["predicted_label"] for v in vert_dicts]
-            end_time = time.time()
             print(f"✓ Detected {len(vert_dicts)} vertebrae: {detected_labels}")
-            print(f"  Elapsed time: {end_time - start_time:.2f}s")
 
             # Grade IVDs
             print("\n[3/3] Grading intervertebral discs...")
-            start_time = time.time()
             ivd_dicts = spnt.get_ivds_from_vert_dicts(vert_dicts, scan.volume)
             ivd_grades = spnt.grade_ivds(ivd_dicts)
 
@@ -357,14 +430,66 @@ def main():
             print("=" * 60)
             print(ivd_grades)
 
-            # Save results
-            output_file = f'{results_dir}/{scan_name}_test_results.csv'
-            ivd_grades.to_csv(output_file)
-            end_time = time.time()
-            print(f"\n✓ Results saved to: {output_file}")
-            print(f"  Elapsed time: {end_time - start_time:.2f}s")
+            # Transform data for master csv files
+            wide_full, long_full, wide_pf, long_pf = process_ivd_grades(ivd_grades, subject_id_clean)
+
+            series_desc = item.get("series_description", None)
+
+            long_full["series_desc"] = series_desc
+            long_full["repeat_index"] = repeat_idx
+            long_full["is_primary"] = is_primary
+
+            long_pf["series_desc"] = series_desc
+            long_pf["repeat_index"] = repeat_idx
+            long_pf["is_primary"] = is_primary
+
+            wide_pf["series_desc"] = series_desc
+            wide_pf["repeat_index"] = repeat_idx
+            wide_pf["is_primary"] = is_primary
+
+            wide_full_rows.append(wide_full)
+            long_full_rows.append(long_full)
+
+            wide_pf_rows.append(wide_pf)
+            long_pf_rows.append(long_pf)
+
+    print("\n✓ Saved outputs:")
+    # ---------- FULL SCORING ----------
+    # Comment out this section if only interested in Pfirrmann grading
+    df_wide_full = pd.DataFrame(wide_full_rows)
+    df_long_full = pd.concat(long_full_rows, ignore_index=True)
+    df_wide_full.to_csv(os.path.join(results_dir, "spinenet_wide.csv"), index=False)
+    df_long_full.to_csv(os.path.join(results_dir, "spinenet_long.csv"), index=False)
+    print("  - spinenet_wide.csv")
+    print("  - spinenet_long.csv")
+
+    # ---------- PFIRRMANN ONLY ----------
+    df_wide_pf = pd.DataFrame(wide_pf_rows)
+    df_long_pf = pd.concat(long_pf_rows, ignore_index=True)
+    df_wide_pf.to_csv(os.path.join(results_dir, "spinenet_pfirrmann_wide_repeats.csv"), index=False)
+    df_long_pf.to_csv(os.path.join(results_dir, "spinenet_pfirrmann_long_repeats.csv"), index=False)
+    print("  - spinenet_pfirrmann_wide_repeats.csv")
+    print("  - spinenet_pfirrmann_long_repeats.csv")
+    # FINAL ANALYSIS CSV FOR METAGWAS (NO REPEAT IDS)
+    df_wide_pf_final = df_wide_pf[df_wide_pf["is_primary"] == True]
+    df_wide_pf_final.to_csv(os.path.join(results_dir, "spinenet_pfirrmann_wide.csv"), index=False)
+    print("  - spinenet_pfirrmann_wide.csv")
+
+    # ---------- OPTIONAL QC: repeat consistency ----------
+    df_inconsist = find_repeat_inconsistencies(df_long_pf)
+
+    qc_file = os.path.join(results_dir, "spinenet_repeat_inconsistencies.csv")
+
+    if not df_inconsist.empty:
+        df_inconsist.to_csv(qc_file, index=False)
+        print(f"  - spinenet_repeat_inconsistencies.csv (inconsistencies found)")
+    else:
+        # still write empty file for record-keeping
+        df_inconsist.to_csv(qc_file, index=False)
+        print(f"  - spinenet_repeat_inconsistencies.csv (no inconsistencies)")
 
     print("\n" + "=" * 60)
+    print(f"\nProcessed {total} subjects.")
     print("SpineNet batch run completed successfully!")
     print("=" * 60)
 
